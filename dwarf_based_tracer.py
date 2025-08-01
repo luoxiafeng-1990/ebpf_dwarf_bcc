@@ -277,11 +277,10 @@ class DwarfBasedTracer:
                     print(f"✓ 已附加kretprobe到 {func_name} (退出)")
                     
             except Exception as e:
-                print(f"✗ 无法附加kprobe到 {func_name}: {e}")
+                # 静默处理错误，因为我们会定期重试
+                pass
         
         if success_count == 0:
-            print("✗ 没有成功附加任何kprobe")
-            print("提示: 确保tacosys.ko模块已加载且以root权限运行")
             return False
         
         print(f"✓ 成功附加 {success_count} 个函数的kprobe")
@@ -294,7 +293,7 @@ class DwarfBasedTracer:
         relative_time = (event.ts - (self.start_time * 1000000000)) / 1000000
         function_name = event.function.decode('utf-8', 'replace').rstrip('\x00')
         
-        print(f"\n{'='*100}")
+        print(f"\n\n{'='*100}")
         print(f"[{self.event_count:04d}] {datetime.now().strftime('%H:%M:%S.%f')[:-3]} | "
               f"时间: +{relative_time:.3f}ms")
         print(f"PID: {event.pid} | TID: {event.tid} | 进程: {event.comm.decode('utf-8', 'replace')}")
@@ -352,17 +351,46 @@ class DwarfBasedTracer:
         if not self.load_bpf_program():
             return False
         
-        if not self.attach_kprobes():
-            return False
-        
-        self.bpf["breakpoint_events"].open_perf_buffer(self.print_event)
+        # 设置5分钟超时
+        timeout_seconds = 5 * 60  # 5分钟
+        start_time = time.time()
+        kprobes_attached = False
+        last_retry_time = 0
         
         print(f"\n开始跟踪... (按Ctrl+C停止)")
-        print("请加载或操作tacosys.ko模块以触发断点事件\n")
+        print("等待tacosys.ko模块加载...")
+        print("超时时间: 5分钟 (如果没有检测到ko加载将自动退出)\n")
         
         try:
             while True:
-                self.bpf.perf_buffer_poll(timeout=100)
+                current_time = time.time()
+                elapsed_time = current_time - start_time
+                
+                # 检查是否超时
+                if elapsed_time >= timeout_seconds:
+                    print(f"\n\n超时退出: 已等待{timeout_seconds//60}分钟，未检测到ko加载事件")
+                    print(f"总事件数: {self.event_count}")
+                    return True
+                
+                # 如果kprobe还没有附加成功，每10秒重试一次
+                if not kprobes_attached and (current_time - last_retry_time) >= 10:
+                    print(f"尝试附加kprobe... (已等待{int(elapsed_time)}秒)")
+                    if self.attach_kprobes():
+                        kprobes_attached = True
+                        self.bpf["breakpoint_events"].open_perf_buffer(self.print_event)
+                        print("kprobe附加成功，开始监听事件...")
+                    else:
+                        remaining_time = timeout_seconds - elapsed_time
+                        print(f"kprobe附加失败，将在10秒后重试 (剩余{int(remaining_time)}秒)")
+                    last_retry_time = current_time
+                
+                # 如果kprobe已经附加，开始监听事件
+                if kprobes_attached:
+                    self.bpf.perf_buffer_poll(timeout=1000)  # 1秒超时
+                else:
+                    # 如果还没有附加成功，等待1秒
+                    time.sleep(1)
+                    
         except KeyboardInterrupt:
             print(f"\n\n跟踪完成 | 总事件数: {self.event_count}")
             return True
