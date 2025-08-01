@@ -103,140 +103,58 @@ USER_BREAKPOINTS = [
     {"line": 111, "function": "base_mod_exit", "vars": []}
 ]
 
-# eBPF程序
+# 极简安全的eBPF程序 - 添加大量调试信息
 BPF_PROGRAM = """
 #include <uapi/linux/ptrace.h>
 #include <linux/sched.h>
-#include <linux/string.h>
 
-// 事件数据结构
-struct dwarf_breakpoint_event_t {
+// 最简单的事件结构
+struct debug_event_t {
     u32 pid;
-    u32 tid;
     u64 ts;
-    u32 line;
-    char function[32];
-    char comm[TASK_COMM_LEN];
-    u64 frame_pointer;
-    u64 stack_pointer;
-    u64 var_values[8];
-    u32 var_count;
-    char var_info[256];
+    u32 function_id;  // 用数字代替字符串，更安全
 };
 
 BPF_PERF_OUTPUT(breakpoint_events);
 
-// 从栈帧读取变量
-static inline u64 read_frame_var(struct pt_regs *ctx, int offset) {
-    u64 fp = PT_REGS_FP(ctx);
-    u64 value = 0;
-    bpf_probe_read_kernel(&value, sizeof(value), (void*)(fp + offset));
-    return value;
+// 严格的事件频率限制
+BPF_ARRAY(event_limiter, u64, 1);
+
+static inline int should_trace() {
+    u32 key = 0;
+    u64 *counter = event_limiter.lookup(&key);
+    if (!counter) {
+        return 0;
+    }
+    
+    u64 current_time = bpf_ktime_get_ns();
+    u64 last_time = *counter;
+    
+    // 严格限制：每2秒最多1个事件
+    if (current_time - last_time < 2000000000ULL) {
+        return 0;
+    }
+    
+    event_limiter.update(&key, &current_time);
+    return 1;
 }
 
-// mmz_param_parse函数跟踪
-int trace_mmz_param_parse_entry(struct pt_regs *ctx) {
-    struct dwarf_breakpoint_event_t data = {};
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    
-    data.pid = pid_tgid >> 32;
-    data.tid = (u32)pid_tgid;
-    data.ts = bpf_ktime_get_ns();
-    data.line = 18;
-    data.frame_pointer = PT_REGS_FP(ctx);
-    data.stack_pointer = PT_REGS_SP(ctx);
-    bpf_get_current_comm(&data.comm, sizeof(data.comm));
-    __builtin_memcpy(data.function, "mmz_param_parse", 16);
-    
-    data.var_count = 0;
-    data.var_values[0] = 0;  // ret变量初始值
-    data.var_count++;
-    data.var_values[1] = read_frame_var(ctx, -176);  // cur变量
-    data.var_count++;
-    
-    __builtin_memcpy(data.var_info, "ret:int:0,cur:char*:-176", 25);
-    
-    breakpoint_events.perf_submit(ctx, &data, sizeof(data));
-    return 0;
-}
-
-// mmz_param_parse函数退出跟踪
-int trace_mmz_param_parse_exit(struct pt_regs *ctx) {
-    struct dwarf_breakpoint_event_t data = {};
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    
-    data.pid = pid_tgid >> 32;
-    data.tid = (u32)pid_tgid;
-    data.ts = bpf_ktime_get_ns();
-    data.line = 0;
-    data.frame_pointer = PT_REGS_FP(ctx);
-    bpf_get_current_comm(&data.comm, sizeof(data.comm));
-    __builtin_memcpy(data.function, "mmz_param_parse", 16);
-    
-    data.var_values[0] = PT_REGS_RC(ctx);  // 返回值
-    data.var_count = 1;
-    __builtin_memcpy(data.var_info, "return_value:int", 17);
-    
-    breakpoint_events.perf_submit(ctx, &data, sizeof(data));
-    return 0;
-}
-
-// base_mod_init函数跟踪
+// 只跟踪一个函数，最简单最安全
 int trace_base_mod_init_entry(struct pt_regs *ctx) {
-    struct dwarf_breakpoint_event_t data = {};
+    // 严格的频率和安全检查
+    if (!should_trace()) {
+        return 0;
+    }
+    
     u64 pid_tgid = bpf_get_current_pid_tgid();
+    if (pid_tgid == 0) {
+        return 0;
+    }
     
+    struct debug_event_t data = {};
     data.pid = pid_tgid >> 32;
-    data.tid = (u32)pid_tgid;
     data.ts = bpf_ktime_get_ns();
-    data.line = 88;
-    data.frame_pointer = PT_REGS_FP(ctx);
-    bpf_get_current_comm(&data.comm, sizeof(data.comm));
-    __builtin_memcpy(data.function, "base_mod_init", 14);
-    
-    data.var_values[0] = 0;  // ret变量初始值
-    data.var_count = 1;
-    __builtin_memcpy(data.var_info, "ret:int:0", 10);
-    
-    breakpoint_events.perf_submit(ctx, &data, sizeof(data));
-    return 0;
-}
-
-// base_mod_init函数退出跟踪
-int trace_base_mod_init_exit(struct pt_regs *ctx) {
-    struct dwarf_breakpoint_event_t data = {};
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    
-    data.pid = pid_tgid >> 32;
-    data.tid = (u32)pid_tgid;
-    data.ts = bpf_ktime_get_ns();
-    data.line = 0;
-    data.frame_pointer = PT_REGS_FP(ctx);
-    bpf_get_current_comm(&data.comm, sizeof(data.comm));
-    __builtin_memcpy(data.function, "base_mod_init", 14);
-    
-    data.var_values[0] = PT_REGS_RC(ctx);  // 返回值
-    data.var_count = 1;
-    __builtin_memcpy(data.var_info, "return_value:int", 17);
-    
-    breakpoint_events.perf_submit(ctx, &data, sizeof(data));
-    return 0;
-}
-
-// base_mod_exit函数跟踪
-int trace_base_mod_exit_entry(struct pt_regs *ctx) {
-    struct dwarf_breakpoint_event_t data = {};
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    
-    data.pid = pid_tgid >> 32;
-    data.tid = (u32)pid_tgid;
-    data.ts = bpf_ktime_get_ns();
-    data.line = 109;
-    data.frame_pointer = PT_REGS_FP(ctx);
-    bpf_get_current_comm(&data.comm, sizeof(data.comm));
-    __builtin_memcpy(data.function, "base_mod_exit", 14);
-    
-    data.var_count = 0;
+    data.function_id = 1;  // base_mod_init = 1
     
     breakpoint_events.perf_submit(ctx, &data, sizeof(data));
     return 0;
@@ -259,86 +177,36 @@ class DwarfBasedTracer:
             return False
     
     def attach_kprobes(self):
-        success_count = 0
-        functions = [
-            ("mmz_param_parse", "trace_mmz_param_parse_entry", "trace_mmz_param_parse_exit"),
-            ("base_mod_init", "trace_base_mod_init_entry", "trace_base_mod_init_exit"),
-            ("base_mod_exit", "trace_base_mod_exit_entry", None)
-        ]
-        
-        for func_name, entry_handler, exit_handler in functions:
-            try:
-                self.bpf.attach_kprobe(event=func_name, fn_name=entry_handler)
-                print(f"✓ 已附加kprobe到 {func_name} (入口)")
-                success_count += 1
-                
-                if exit_handler:
-                    self.bpf.attach_kretprobe(event=func_name, fn_name=exit_handler)
-                    print(f"✓ 已附加kretprobe到 {func_name} (退出)")
-                    
-            except Exception as e:
-                # 静默处理错误，因为我们会定期重试
-                pass
-        
-        if success_count == 0:
+        print("[DEBUG] 开始附加kprobe...")
+        try:
+            # 只附加一个最简单的kprobe
+            self.bpf.attach_kprobe(event="base_mod_init", fn_name="trace_base_mod_init_entry")
+            print("[DEBUG] ✓ 成功附加kprobe到 base_mod_init")
+            return True
+        except Exception as e:
+            print(f"[DEBUG] kprobe附加失败: {e}")
             return False
-        
-        print(f"✓ 成功附加 {success_count} 个函数的kprobe")
-        return True
     
     def print_event(self, cpu, data, size):
-        event = self.bpf["breakpoint_events"].event(data)
-        self.event_count += 1
-        
-        relative_time = (event.ts - (self.start_time * 1000000000)) / 1000000
-        function_name = event.function.decode('utf-8', 'replace').rstrip('\x00')
-        
-        print(f"\n\n{'='*100}")
-        print(f"[{self.event_count:04d}] {datetime.now().strftime('%H:%M:%S.%f')[:-3]} | "
-              f"时间: +{relative_time:.3f}ms")
-        print(f"PID: {event.pid} | TID: {event.tid} | 进程: {event.comm.decode('utf-8', 'replace')}")
-        print(f"函数: {function_name} | 行号: {event.line if event.line > 0 else '退出'}")
-        
-        if function_name in DWARF_PRECISE_INFO:
-            dwarf_info = DWARF_PRECISE_INFO[function_name]
-            print(f"DWARF信息: 偏移=0x{dwarf_info['dwarf_offset']:x}, "
-                  f"地址=0x{dwarf_info['address_offset']:x}, 大小=0x{dwarf_info['size']:x}")
-        
-        print(f"栈帧: FP=0x{event.frame_pointer:x}, SP=0x{event.stack_pointer:x}")
-        
-        if event.var_count > 0:
-            print(f"变量信息 ({event.var_count}个):")
-            var_info_str = event.var_info.decode('utf-8', 'replace').rstrip('\x00')
+        print("[DEBUG] 进入事件处理回调...")
+        try:
+            event = self.bpf["breakpoint_events"].event(data)
+            self.event_count += 1
             
-            if var_info_str:
-                var_infos = var_info_str.split(',')
-                for i, var_info in enumerate(var_infos[:event.var_count]):
-                    if ':' in var_info:
-                        parts = var_info.split(':')
-                        if len(parts) >= 2:
-                            var_name = parts[0]
-                            var_type = parts[1]
-                            location = parts[2] if len(parts) > 2 else "unknown"
-                            
-                            if i < len(event.var_values):
-                                value = event.var_values[i]
-                                print(f"  {var_name}({var_type}): {value} (0x{value:x}) [DWARF位置: {location}]")
-            else:
-                for i in range(min(event.var_count, len(event.var_values))):
-                    print(f"  var_{i}: {event.var_values[i]} (0x{event.var_values[i]:x})")
-        else:
-            print("变量信息: 无")
-        
-        matching_bp = None
-        for bp in USER_BREAKPOINTS:
-            if bp['line'] == event.line and bp['function'] == function_name:
-                matching_bp = bp
-                break
-        
-        if matching_bp:
-            print(f"匹配断点: 行{matching_bp['line']} | 期望变量: {', '.join(matching_bp['vars'])}")
-        
-        print(f"{'='*100}")
+            # 函数ID映射
+            function_names = {1: "base_mod_init"}
+            function_name = function_names.get(event.function_id, "unknown")
+            
+            print(f"\n\n[DEBUG] >>> 事件 #{self.event_count:04d} <<<")
+            print(f"[DEBUG] 函数: {function_name}")
+            print(f"[DEBUG] PID: {event.pid}")
+            print(f"[DEBUG] 时间戳: {event.ts}")
+            print("[DEBUG] 事件处理完成")
+            
+        except Exception as e:
+            print(f"[DEBUG] 事件处理异常: {e}")
+            import traceback
+            traceback.print_exc()
     
     def run(self):
         print("TacoSys DWARF精确调试跟踪器")
@@ -386,7 +254,15 @@ class DwarfBasedTracer:
                 
                 # 如果kprobe已经附加，开始监听事件
                 if kprobes_attached:
-                    self.bpf.perf_buffer_poll(timeout=1000)  # 1秒超时
+                    print("[DEBUG] 开始轮询事件...")
+                    try:
+                        self.bpf.perf_buffer_poll(timeout=1000)  # 1秒超时
+                        print("[DEBUG] 轮询完成")
+                    except Exception as e:
+                        print(f"[DEBUG] 轮询异常: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        time.sleep(1)
                 else:
                     # 如果还没有附加成功，等待1秒
                     time.sleep(1)
